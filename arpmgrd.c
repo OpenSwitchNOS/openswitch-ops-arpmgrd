@@ -49,6 +49,7 @@
 
 #include "arpmgrd.h"
 
+
 VLOG_DEFINE_THIS_MODULE(arpmgrd);
 COVERAGE_DEFINE(arpmgr);
 static struct ovsdb_idl *idl;
