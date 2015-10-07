@@ -752,6 +752,9 @@ receive_neighbor_update(int sock)
         char buffer[RECV_BUFFER_SIZE];
         int ret;
 
+        memset(buffer, 0, sizeof(buffer));
+        memset(&nladdr, 0, sizeof(nladdr));
+
         iov.iov_base = (void *)buffer;
         iov.iov_len = sizeof(buffer);
         msg.msg_name = (void *)&(nladdr);
