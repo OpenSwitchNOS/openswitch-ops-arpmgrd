@@ -852,6 +852,7 @@ ovsrec_neighbor_alloc_cnt %d, force_ins_cnt %d force_del_cnt %d, ovs_idl_nbr_cnt
             break;
 
         default:
+            VLOG_DBG("received nl msg_type %u", nlh->nlmsg_type);
             break;
         }
 
@@ -1131,10 +1132,8 @@ arpmgrd_reconfigure_neighbor(struct ovsdb_idl *idl)
         /* Check if dp_hit changed */
         if (cache_nbr->dp_hit != dp_hit) {
             /* If dp_hit is set, state in not reachable send probe */
-            if (dp_hit && strcmp(cache_nbr->state,
-                    OVSREC_NEIGHBOR_STATE_REACHABLE) &&
-                    strcmp(cache_nbr->state,
-                    OVSREC_NEIGHBOR_STATE_PERMANENT) &&
+            if (dp_hit &&(0 == strcmp(cache_nbr->state,
+                    OVSREC_NEIGHBOR_STATE_STALE)) &&
                     (nl_neighbor_sock > 0)) {
                 int family = AF_INET;
                 uint32_t dst[8];
