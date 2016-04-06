@@ -270,6 +270,7 @@ class arpManagerTxnFailTests(OpsVsiTest):
         info("Verified modified/deleted entries after ovsdb restart\n")
 
 
+@pytest.mark.skipif(True, reason="Disabling old tests")
 class Test_arp_manager_txn_fail:
 
     def setup_class(cls):
