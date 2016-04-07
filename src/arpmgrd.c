@@ -974,6 +974,7 @@ arpmgrd_reconfigure_port(struct ovsdb_idl *idl)
     const struct ovsrec_port *first_row, *row;
     struct shash_node *sh_port, *sh_port_next;
     struct shash_node *sh_nbr, *sh_nbr_next;
+    bool ask_kernel_neighbor_tbl_dump = false;
 
     first_row = ovsrec_port_first(idl);
 
@@ -996,7 +997,7 @@ arpmgrd_reconfigure_port(struct ovsdb_idl *idl)
 
     OVSREC_PORT_FOR_EACH (row, idl) {
         if (!shash_add_once(&sh_idl_ports, row->name, row)) {
-            VLOG_WARN("port %s specified twice", row->name);
+            VLOG_WARN("port %s specified twice in IDL", row->name);
         }
     }
 
@@ -1046,15 +1047,19 @@ arpmgrd_reconfigure_port(struct ovsdb_idl *idl)
                 if (!shash_add_once(&all_ports, port_row->name, new_port)) {
                     VLOG_WARN("Port %s specified twice", port_row->name);
                     free(new_port);
+                    new_port = NULL;
+                    continue;
                 }
-
                 new_port->port = port_row;
-
-                /* Send netlink DUMP request to kernel to check for any existing
-                 * neighbors on this PORT */
-                if (nl_neighbor_sock > 0) {
-                    netlink_request_neighbor_dump(nl_neighbor_sock);
-                }
+                ask_kernel_neighbor_tbl_dump = true;
+            }
+        }
+        if(ask_kernel_neighbor_tbl_dump){
+            /* Send netlink DUMP request to kernel to check for any existing
+             * neighbors on this PORT */
+            if (nl_neighbor_sock > 0) {
+                netlink_request_neighbor_dump(nl_neighbor_sock);
+                VLOG_DBG("Asked for a dump from kernel");
             }
         }
     }
