@@ -5,6 +5,7 @@ What is ops-arpmgrd?
 --------------------
 The`ops-arpmgrd` is the repo for the OpenSwitch `ops-arpmgrd` daemon. The `ops-arpmgrd` daemon updates and manages the neighbor entries learned by the kernel in the OpenSwitch Neighbor table.
 
+
 What is the structure of the repository?
 ----------------------------------------
 * **src** - contains all source files.
