@@ -400,6 +400,7 @@ class arpManagerFunctionalityTests(OpsVsiTest):
             {\"op\" : \"update\",\"table\" : \"Neighbor\",\"where\":\
             [[\"ip_address\",\"==\",\"2000::2\"]],\"row\":{\"status\":\
             [\"map\",[[\"dp_hit\",\"true\"]]]}}]'"
+        sleep(1);
 
         s1.cmd(json_cfg_dp_hit)
         info("Configured dp hit to true for 2000::2. "
