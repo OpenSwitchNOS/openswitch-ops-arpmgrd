@@ -46,14 +46,14 @@
 #include "coverage.h"
 #include "fatal-signal.h"
 #include "stream.h"
-
+#include "dynamic-string.h"
 #include "arpmgrd.h"
 
 VLOG_DEFINE_THIS_MODULE(arpmgrd);
 COVERAGE_DEFINE(arpmgr);
 static struct ovsdb_idl *idl;
 static unsigned int idl_seqno;
-static unixctl_cb_func arpmgrd_unixctl_dump;
+static unixctl_cb_func arpmgrd_unixctl_debug_cnt;
 static int system_configured = false;
 static unixctl_cb_func arpmgrd_exit_cb;
 static char *parse_options(int argc, char *argv[], char **unixctl_path);
@@ -61,7 +61,11 @@ OVS_NO_RETURN static void usage(void);
 static struct ovsdb_idl_txn *txn = NULL;
 static enum ovsdb_idl_txn_status txn_status = TXN_SUCCESS;
 static bool ovsdb_commit_required = false;
-
+static int port_data_alloc = 0;
+static int nbr_alloc_cnt=0;
+static int ovsrec_neighbor_alloc_cnt = 0;
+static int idl_nbr_force_ins_cnt,ovs_idl_nbr_cnt, idl_nbr_force_del_cnt;
+static int all_neighbors_len;
 typedef enum sync {
     SYNC_NONE,
     SYNC_REQUESTED,
@@ -77,7 +81,7 @@ typedef enum sync_mode {
 
 static sync_mode_e sync_mode = SYNC_WITHOUT_CACHE_RESET;
 static sync_state_e sync_state = SYNC_REQUESTED;
-
+static int gbl_nl_pkt_process_cnt_per_iter = 100;
 
 /* Netlink */
 struct nl_req {
@@ -105,6 +109,7 @@ struct port_data {
 
 /* Mapping of all ports */
 static struct shash all_ports = SHASH_INITIALIZER(&all_ports);
+struct shash idl_neighbors = SHASH_INITIALIZER(&idl_neighbors);
 
 /* Neighbor cache structure */
 struct neighbor_data {
@@ -158,8 +163,10 @@ add_neighbor_to_cache(char *vrf, char *ip_address)
         if (!sh_node) {
             /* Allocate structure to save state information for this interface. */
             new_nbr = (struct neighbor_data *) xcalloc(1, sizeof *new_nbr);
+            nbr_alloc_cnt++;
             if (!shash_add(&all_neighbors, key, new_nbr)) {
                 free(new_nbr);
+                nbr_alloc_cnt--;
                 new_nbr = NULL;
                 VLOG_WARN("vrf %s Neighbor %s : Unable to add neighbor", vrf, ip_address);
             }
@@ -192,9 +199,48 @@ delete_neighbor_from_cache(char *vrf_name, char *ip_address)
     }
 
     free(sh_node->data);
+    nbr_alloc_cnt--;
     shash_delete(&all_neighbors, sh_node);
 } /* delete_neighbor_from_cache */
+static void
+delete_nbr_from_idl_neighbors(char *vrf_name, char *ip_address)
+{
+    char key[VRF_IP_KEY_MAX_LEN];
+    struct shash_node *sh_node;
+    get_hash_key(vrf_name, ip_address, key);
+    sh_node = shash_find(&idl_neighbors, key);
 
+    if (!sh_node) {
+        VLOG_ERR("Unable to find a neighbor %s, vrf %s that has entry "
+                "in hash", ip_address, vrf_name);
+        return;
+    }
+    shash_delete(&idl_neighbors,sh_node);
+}
+
+/* Find a neighbor in idl cache */
+static struct ovsrec_neighbor*
+find_neighbor_in_idl_neighbors(char *vrf_name, char *ip_address){
+    struct ovsrec_neighbor *ovs_nbr = NULL;
+    struct shash_node *sh_node;
+    char key[VRF_IP_KEY_MAX_LEN];
+
+    if (!get_hash_key(vrf_name, ip_address, key)) {
+        VLOG_ERR("Unable to get key for entry");
+        return ovs_nbr;
+    }
+
+    sh_node = shash_find(&idl_neighbors, key);
+
+    if (!sh_node) {
+        VLOG_DBG("Unable to find a neighbor %s, vrf %s that has entry "
+                "in hash", ip_address, vrf_name);
+        return ovs_nbr;
+    }
+
+    ovs_nbr= sh_node->data;
+    return ovs_nbr;
+}
 /* Find a neighbor in local cache */
 static struct neighbor_data*
 find_neighbor_in_cache(char *vrf_name, char *ip_address)
@@ -227,7 +273,7 @@ find_neighbor_in_cache(char *vrf_name, char *ip_address)
  * Send a neighbor dump request on socket
  * */
 static int
-netlink_socket_open(int protocol, int group)
+netlink_socket_open(int protocol, int group, bool kernel_dump)
 {
     struct sockaddr_nl s_addr;
 
@@ -246,7 +292,11 @@ netlink_socket_open(int protocol, int group)
         return -1;
     }
 
-    netlink_request_neighbor_dump(sock);
+    if(kernel_dump){
+        netlink_request_neighbor_dump(sock);
+        if(sync_state == SYNC_REQUESTED)
+            sync_state = SYNC_IN_PROGRESS;
+    }
     return sock;
 } /* netlink_socket_open */
 
@@ -315,8 +365,8 @@ send_neighbor_probe(int sock, int ifindex, int family, void* ip, int plen)
 
     if (send(sock, &req, req.nlh.nlmsg_len, 0) == -1) {
         VLOG_ERR("Failed to send netlink request for neighbor probe");
+        return;
     }
-
     return;
 } /* send_neighbor_probe */
 
@@ -327,8 +377,9 @@ static int
 update_neighbor_to_ovsdb(struct neighbor_data *cache_nbr,
                          bool insert_row_without_checking)
 {
-    const struct ovsrec_neighbor *ovs_nbr;
+    const struct ovsrec_neighbor *ovs_nbr = NULL;
     bool found = false;
+    char key[VRF_IP_KEY_MAX_LEN];
 
     if (!insert_row_without_checking) {
         /*
@@ -340,15 +391,9 @@ update_neighbor_to_ovsdb(struct neighbor_data *cache_nbr,
             ovs_nbr = cache_nbr->nbr;
             found = true;
         } else {
-            OVSREC_NEIGHBOR_FOR_EACH (ovs_nbr, idl) {
-                if (!strcmp((ovs_nbr)->ip_address, cache_nbr->ip_address) &&
-                        ovs_nbr->vrf == cache_nbr->vrf) {
-                    /* Update cache with pointer to ovsrec */
-                    cache_nbr->nbr = ovs_nbr;
-                    found = true;
-                    break;
-                }
-            }
+            ovs_nbr = find_neighbor_in_idl_neighbors(cache_nbr->vrf->name, cache_nbr->ip_address);
+            if(ovs_nbr){found = true;}
+
         }
     }
 
@@ -373,6 +418,8 @@ update_neighbor_to_ovsdb(struct neighbor_data *cache_nbr,
         }
     } else {
         ovs_nbr = ovsrec_neighbor_insert(txn);
+
+        ovsrec_neighbor_alloc_cnt ++;
         if (ovs_nbr) {
             ovsrec_neighbor_set_ip_address(ovs_nbr, cache_nbr->ip_address);
             ovsrec_neighbor_set_vrf(ovs_nbr, cache_nbr->vrf);
@@ -381,6 +428,8 @@ update_neighbor_to_ovsdb(struct neighbor_data *cache_nbr,
             ovsrec_neighbor_set_mac(ovs_nbr, cache_nbr->mac);
             ovsrec_neighbor_set_state(ovs_nbr, cache_nbr->state);
             ovsdb_commit_required = true;
+            get_hash_key(cache_nbr->vrf->name, cache_nbr->ip_address, key);
+            shash_add_once(&idl_neighbors, key,ovs_nbr);
         }
     }
     return 1;
@@ -394,6 +443,7 @@ delete_nbr_from_ovsdb(const struct ovsrec_neighbor *ovs_nbr)
         VLOG_DBG("Deleting neighbor vrf %s ip address %s from Neighbor table",
                 ovs_nbr->vrf ? ovs_nbr->vrf->name : "none", ovs_nbr->ip_address);
         ovsrec_neighbor_delete(ovs_nbr);
+        ovsrec_neighbor_alloc_cnt --;
         ovsdb_commit_required = true;
     }
 } /* delete_nbr_from_ovsdb */
@@ -402,7 +452,7 @@ delete_nbr_from_ovsdb(const struct ovsrec_neighbor *ovs_nbr)
 static void
 delete_cache_nbr_from_ovsdb(struct neighbor_data *cache_nbr)
 {
-    const struct ovsrec_neighbor *ovs_nbr;
+    const struct ovsrec_neighbor *ovs_nbr = NULL;
     bool found = false;
     /*
      * Check of cache entry has pointer to ovsrec, else search in idl
@@ -413,18 +463,15 @@ delete_cache_nbr_from_ovsdb(struct neighbor_data *cache_nbr)
         ovs_nbr = cache_nbr->nbr;
         found = true;
     } else {
-        OVSREC_NEIGHBOR_FOR_EACH (ovs_nbr, idl) {
-            if (!strcmp((ovs_nbr)->ip_address, cache_nbr->ip_address) &&
-                    ovs_nbr->vrf == cache_nbr->vrf) {
-                /* Update cache with pointer to ovsrec */
-                cache_nbr->nbr = ovs_nbr;
-                found = true;
-                break;
-            }
+        ovs_nbr = find_neighbor_in_idl_neighbors(cache_nbr->vrf->name, cache_nbr->ip_address);
+        if(ovs_nbr){
+            cache_nbr->nbr = ovs_nbr;
+            found = true;
         }
     }
     if (found) {
         delete_nbr_from_ovsdb(ovs_nbr);
+        delete_nbr_from_idl_neighbors(cache_nbr->vrf->name, cache_nbr->ip_address);
     }
 } /* delete_cache_nbr_from_ovsdb */
 
@@ -436,10 +483,11 @@ delete_cache_nbr_from_ovsdb(struct neighbor_data *cache_nbr)
 static void
 resync_db_with_kernel()
 {
-    struct shash idl_neighbors;
     const struct ovsrec_neighbor *ovs_nbr;
     struct shash_node *sh_node, *sh_next;
-
+    ovs_idl_nbr_cnt = 0;
+    all_neighbors_len = 0;
+    shash_destroy(&idl_neighbors);
     /* Collect all the interfaces in the dB. */
     shash_init(&idl_neighbors);
     OVSREC_NEIGHBOR_FOR_EACH(ovs_nbr, idl) {
@@ -448,6 +496,9 @@ resync_db_with_kernel()
         if (!shash_add_once(&idl_neighbors, key, ovs_nbr)) {
             VLOG_WARN("Neighbor vrf name %s ip address %s"
                     "specified twice", ovs_nbr->vrf->name, ovs_nbr->ip_address);
+        }
+        else{
+            ovs_idl_nbr_cnt ++;
         }
     }
 
@@ -479,10 +530,12 @@ resync_db_with_kernel()
         if (!idl_nbr) {
             /* force insert here */
             update_neighbor_to_ovsdb(cache_nbr, true);
+            idl_nbr_force_ins_cnt ++;
         } else {
             cache_nbr->nbr = idl_nbr;
             update_neighbor_to_ovsdb(cache_nbr, false);
         }
+        all_neighbors_len ++;
     }
 
     /*
@@ -502,12 +555,15 @@ resync_db_with_kernel()
                     shash_find_data(&all_neighbors, sh_node->name);
             if (!cache_nbr) {
                 /* delete the ovsrec */
+                idl_nbr_force_del_cnt ++;
                 const struct ovsrec_neighbor *ovs_nbr = sh_node->data;
                 delete_nbr_from_ovsdb(ovs_nbr);
+                shash_delete(&idl_neighbors,sh_node);
             }
         }
     }
-
+    shash_destroy(&idl_neighbors);
+    shash_init(&idl_neighbors);
     if (sync_state != SYNC_FAILED && sync_state != SYNC_REQUESTED) {
         sync_state = SYNC_COMPLETE;
     }
@@ -679,18 +735,14 @@ del_neighbor(struct ndmsg* ndm, struct rtattr* rta,
             } else if (ndm->ndm_family == AF_INET6) {
                 inet_ntop(AF_INET6, RTA_DATA(rta), destip, INET6_ADDRSTRLEN);
             }
-
-            OVSREC_NEIGHBOR_FOR_EACH (ovs_nbr, idl) {
-                if (!strcmp((ovs_nbr)->ip_address, destip) && ovs_nbr->vrf == vrf) {
-                    found = true;
-                    break;
-                }
-            }
-
+             ovs_nbr = find_neighbor_in_idl_neighbors(vrf->name, destip);
+             if(ovs_nbr){
+                 found = true;
+             }
             if(found) {
                 delete_nbr_from_ovsdb(ovs_nbr);
-                VLOG_DBG("Neighbor delete: %s\n",
-                       destip);
+                delete_nbr_from_idl_neighbors(vrf->name, destip);
+                VLOG_DBG("Neighbor delete: %s\n",destip);
             } else {
                 VLOG_ERR("Unable to find neighbor entry for %s in vrf %s. Cannot delete.", destip, vrf->name);
             }
@@ -777,69 +829,80 @@ static int
 receive_neighbor_update(int sock)
 {
     int multipart_msg_end = 0;
-    while (!multipart_msg_end) {
-        struct sockaddr_nl nladdr;
-        struct msghdr msg;
-        struct iovec iov;
-        struct nlmsghdr *nlh;
-        char buffer[RECV_BUFFER_SIZE];
-        int ret;
+    int lcl_nl_dump_res_size = 0;
+    int pkt_cnt = 0;
+    while (pkt_cnt < gbl_nl_pkt_process_cnt_per_iter){
+        while (!multipart_msg_end) {
+            struct sockaddr_nl nladdr;
+            struct msghdr msg;
+            struct iovec iov;
+            struct nlmsghdr *nlh;
+            char buffer[RECV_BUFFER_SIZE];
+            int ret;
 
-        iov.iov_base = (void *)buffer;
-        iov.iov_len = sizeof(buffer);
-        msg.msg_name = (void *)&(nladdr);
-        msg.msg_namelen = sizeof(nladdr);
-        msg.msg_iov = &iov;
-        msg.msg_iovlen = 1;
+            iov.iov_base = (void *)buffer;
+            iov.iov_len = sizeof(buffer);
+            msg.msg_name = (void *)&(nladdr);
+            msg.msg_namelen = sizeof(nladdr);
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
 
-        if(sync_mode == SYNC_WITH_CACHE_RESET) {
-            ret = recvmsg(sock, &msg, 0);
-        } else {
-            ret = recvmsg(sock, &msg, MSG_DONTWAIT);
-        }
-        VLOG_DBG("recvmsg returned %d", ret);
-
-        if (ret < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                VLOG_ERR("err = %s",  strerror(errno) );
-                /* Kernel messages could be overwhelming,
-                   suspend receive temporarily */
-                if(sync_state == SYNC_NONE) {
-                    sync_mode = SYNC_WITH_CACHE_RESET;
-                    sync_state = SYNC_REQUESTED;
-                }
-                else {
-                    sync_state = SYNC_FAILED;
-                }
+            if(sync_mode == SYNC_WITH_CACHE_RESET) {
+                ret = recvmsg(sock, &msg, 0);
+            } else {
+                ret = recvmsg(sock, &msg, MSG_DONTWAIT);
             }
-            return ret;
+            VLOG_DBG("recvmsg returned %d, nbr_alloc_cnt %d, port_data_alloc %d,",
+                ret,nbr_alloc_cnt, port_data_alloc);
+
+            if (ret < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    VLOG_ERR("err = %s ,sync_state %d, nbr_alloc_cnt %d, port_data_alloc %d, \n \
+    ovsrec_neighbor_alloc_cnt %d, force_ins_cnt %d force_del_cnt %d, ovs_idl_nbr_cnt %d,all_neighbors_len %d \n",
+                    strerror(errno),sync_state,nbr_alloc_cnt,
+                    port_data_alloc,ovsrec_neighbor_alloc_cnt,
+                    idl_nbr_force_ins_cnt,idl_nbr_force_del_cnt,ovs_idl_nbr_cnt,
+                    all_neighbors_len);
+                    /* Kernel messages could be overwhelming,
+                       suspend receive temporarily */
+                    if(sync_state == SYNC_NONE) {
+                        sync_mode = SYNC_WITH_CACHE_RESET;
+                        sync_state = SYNC_REQUESTED;
+                    }
+                    else {
+                        sync_state = SYNC_FAILED;
+                    }
+                }
+                return ret;
+            }
+            lcl_nl_dump_res_size += ret;
+            nlh = (struct nlmsghdr*) buffer;
+
+            switch (nlh->nlmsg_type) {
+
+            case RTM_NEWNEIGH:
+            case RTM_DELNEIGH:
+                parse_nlmsg(sock, nlh, ret);
+                break;
+
+            case NLMSG_DONE:
+                VLOG_DBG("End of multipart message\n");
+                multipart_msg_end++;
+                break;
+
+            default:
+                VLOG_DBG("received nl msg_type %u", nlh->nlmsg_type);
+                break;
+            }
+
+            if (!(nlh->nlmsg_flags & NLM_F_MULTI)) {
+                VLOG_DBG("end of message. Not a multipart message\n");
+                break;
+            }
         }
-
-        nlh = (struct nlmsghdr*) buffer;
-
-        switch (nlh->nlmsg_type) {
-
-        case RTM_NEWNEIGH:
-        case RTM_DELNEIGH:
-            parse_nlmsg(sock, nlh, ret);
-            break;
-
-        case NLMSG_DONE:
-            VLOG_DBG("End of multipart message\n");
-            multipart_msg_end++;
-            break;
-
-        default:
-            VLOG_DBG("received nl msg_type %u", nlh->nlmsg_type);
-            break;
-        }
-
-        if (!(nlh->nlmsg_flags & NLM_F_MULTI)) {
-            VLOG_DBG("end of message. Not a multipart message\n");
-            break;
-        }
+        //nl_dump_res_size = (nl_dump_res_size > lcl_nl_dump_res_size)? nl_dump_res_size : lcl_nl_dump_res_size;
+        pkt_cnt ++;
     }
-
     return 0;
 } /* receive_neighbor_update */
 
@@ -941,7 +1004,7 @@ arpmgrd_init(const char *remote)
     ovsdb_idl_add_column(idl, &ovsrec_port_col_name);
 
     unixctl_command_register("arpmgrd/dump", "", 0, 0,
-            arpmgrd_unixctl_dump, NULL);
+            arpmgrd_unixctl_debug_cnt, NULL);
 
     nl_neighbor_sock = 0;
 } /* arpmgrd_init */
@@ -1023,11 +1086,13 @@ arpmgrd_reconfigure_port(struct ovsdb_idl *idl)
                         shash_delete(&all_neighbors, sh_nbr);
 
                         free(nbr_cache);
+                        nbr_alloc_cnt --;
                     }
                 }
 
                 shash_delete(&all_ports, sh_port);
                 free(port_cache);
+                port_data_alloc --;
             }
         }
     }
@@ -1043,11 +1108,13 @@ arpmgrd_reconfigure_port(struct ovsdb_idl *idl)
 
                 /* Allocate structure to save state information for this port. */
                 new_port = xzalloc(sizeof(struct port_data));
+                port_data_alloc++;
 
                 if (!shash_add_once(&all_ports, port_row->name, new_port)) {
                     VLOG_WARN("Port %s specified twice", port_row->name);
                     free(new_port);
                     new_port = NULL;
+                    port_data_alloc --;
                     continue;
                 }
                 new_port->port = port_row;
@@ -1161,6 +1228,7 @@ arpmgrd_reconfigure(struct ovsdb_idl *idl)
 static void
 arpmgrd_run(void)
 {
+    bool kernel_dump = true;
     daemonize_complete();
     vlog_enable_async();
     VLOG_INFO_ONCE("%s (OpenSwitch arpmgrd) %s", program_name, VERSION);
@@ -1179,47 +1247,6 @@ arpmgrd_run(void)
 
     arpmgrd_chk_for_system_configured();
     if (system_configured) {
-
-        /* End "sync in progress state", and reset */
-        if(sync_state == SYNC_COMPLETE) {
-            VLOG_DBG("sync_state is COMPLETE");
-            sync_state = SYNC_NONE;
-            if(sync_mode == SYNC_WITH_CACHE_RESET) {
-                close_netlink_socket(nl_neighbor_sock);
-                VLOG_DBG("closed netlink socket");
-                nl_neighbor_sock = 0;
-            }
-            sync_mode = SYNC_WITHOUT_CACHE_RESET;
-        }
-
-        /* Suspend kernel notifications, and begin resync
-           of OVSDB with kernel */
-        if(sync_state == SYNC_REQUESTED || sync_state == SYNC_FAILED) {
-
-            VLOG_DBG("sync_state changed from %d to IN_PROGRESS", sync_state);
-            if(sync_mode == SYNC_WITH_CACHE_RESET) {
-                /* Clear up our cache for resync */
-                shash_destroy_free_data(&all_neighbors);
-                shash_init(&all_neighbors);
-
-                if(sync_state != SYNC_FAILED) {
-                   /* Close the previous socket */
-                   close_netlink_socket(nl_neighbor_sock);
-                   VLOG_DBG("closed netlink socket");
-                   nl_neighbor_sock = 0;
-
-                   /* Open new socket for resync */
-                   nl_neighbor_sock = netlink_socket_open(NETLINK_ROUTE, 0);
-                }
-            }
-            /* Update state to sync_in_progress */
-            sync_state = SYNC_IN_PROGRESS;
-        }
-
-        if (!nl_neighbor_sock) {
-            VLOG_DBG("opening netlink socket");
-            nl_neighbor_sock = netlink_socket_open(NETLINK_ROUTE, RTMGRP_NEIGH);
-        }
         /*
          * If previous transaction status was incomplete
          * check status again. Else destroy previous
@@ -1243,13 +1270,9 @@ arpmgrd_run(void)
             ovsdb_idl_txn_destroy(txn);
             txn = NULL;
         }
-
-        txn = ovsdb_idl_txn_create(idl);
-
-        arpmgrd_reconfigure(idl);
-        arpmgrd_run__();
-
-        if (sync_state != SYNC_NONE) {
+        if ((sync_state == SYNC_IN_PROGRESS) ||
+            (sync_state == SYNC_FAILED))
+         {
             /* Delete previous transaction
              * We will resync with kernel
              * Create a new transaction
@@ -1262,6 +1285,57 @@ arpmgrd_run(void)
             txn = ovsdb_idl_txn_create(idl);
             resync_db_with_kernel();
         }
+
+        /* End "sync in progress state", and reset */
+        if(sync_state == SYNC_COMPLETE) {
+            VLOG_DBG("sync_state is COMPLETE");
+            sync_state = SYNC_NONE;
+            if(sync_mode == SYNC_WITH_CACHE_RESET) {
+                close_netlink_socket(nl_neighbor_sock);
+                VLOG_DBG("closed netlink socket");
+                nl_neighbor_sock = 0;
+                kernel_dump = false;
+            }
+            sync_mode = SYNC_WITHOUT_CACHE_RESET;
+        }
+
+        /* Suspend kernel notifications, and begin resync
+           of OVSDB with kernel */
+        if(sync_state == SYNC_REQUESTED || sync_state == SYNC_FAILED) {
+
+            VLOG_DBG("sync_state changed from %d to IN_PROGRESS", sync_state);
+            if(sync_mode == SYNC_WITH_CACHE_RESET) {
+                /* Clear up our cache for resync */
+                shash_destroy_free_data(&all_neighbors);
+                shash_init(&all_neighbors);
+                nbr_alloc_cnt = 0;
+
+                if(sync_state != SYNC_FAILED) {
+                   /* Close the previous socket */
+                   close_netlink_socket(nl_neighbor_sock);
+                   VLOG_DBG("closed netlink socket");
+                   nl_neighbor_sock = 0;
+
+                   /* Open new socket for resync */
+                   nl_neighbor_sock = netlink_socket_open(NETLINK_ROUTE, 0, kernel_dump);
+                }
+            }
+            /* Update state to sync_in_progress */
+            sync_state = SYNC_IN_PROGRESS;
+        }
+
+        if (!nl_neighbor_sock) {
+            VLOG_DBG("opening netlink socket");
+            nl_neighbor_sock = netlink_socket_open(NETLINK_ROUTE, RTMGRP_NEIGH, kernel_dump);
+        }
+
+        if(!txn){
+            txn = ovsdb_idl_txn_create(idl);
+        }
+
+        arpmgrd_reconfigure(idl);
+        arpmgrd_run__();
+
 
         if(ovsdb_commit_required == true) {
             txn_status = ovsdb_idl_txn_commit(txn);
@@ -1296,12 +1370,49 @@ arpmgrd_wait(void)
     poll_timer_wait(ARPMGR_POLL_INTERVAL * 1000);
 } /* arpmgrd_wait */
 
+
 static void
-arpmgrd_unixctl_dump(struct unixctl_conn *conn, int argc OVS_UNUSED,
+arpmgrd_unixctl_debug_cnt(struct unixctl_conn *conn, int argc OVS_UNUSED,
         const char *argv[] OVS_UNUSED, void *aux OVS_UNUSED)
 {
-    unixctl_command_reply_error(conn, "Nothing to dump :)");
-} /* arpmgrd_unixctl_dump */
+    const struct ovsrec_neighbor *ovs_nbr;
+    struct shash_node *sh_node, *sh_next;
+    struct ds ds = DS_EMPTY_INITIALIZER;
+    ovs_idl_nbr_cnt = 0;
+    all_neighbors_len = 0;
+    OVSREC_NEIGHBOR_FOR_EACH(ovs_nbr, idl) {
+        ovs_idl_nbr_cnt ++;
+    }
+    SHASH_FOR_EACH_SAFE(sh_node, sh_next, &all_neighbors) {
+        all_neighbors_len ++;
+    }
+    ds_put_format(&ds,
+"nbr_alloc_cnt %d \n\
+port_data_alloc %d \n\
+ovsrec_neighbor_alloc_cnt %d\n\
+force_ins_cnt %d \n\
+force_del_cnt %d \n\
+ovs_idl_nbr_cnt %d,\n\
+all_neighbors_len %d\n",nbr_alloc_cnt,
+                port_data_alloc,ovsrec_neighbor_alloc_cnt,
+                idl_nbr_force_ins_cnt,idl_nbr_force_del_cnt,ovs_idl_nbr_cnt,
+                all_neighbors_len);
+    ds_put_format(&ds,"size_neighbor_data = %lu, size_ovsrec_neighbor = %lu\n",sizeof(struct neighbor_data),
+            sizeof(struct ovsrec_neighbor));
+    if (nl_neighbor_sock){
+        uint32_t rxbufsize;
+        socklen_t rxbufsizeLen = sizeof(rxbufsize);
+        int err = getsockopt(nl_neighbor_sock, SOL_SOCKET, SO_RCVBUF,&rxbufsize, &rxbufsizeLen);
+        if(err <0){
+            ds_put_format(&ds,"\ncurrent SO_RCVBUF size <-1>\n");
+        }
+        else{
+            ds_put_format(&ds,"\ncurrent SO_RCVBUF size 0x%x\n", rxbufsize);
+        }
+    }
+    unixctl_command_reply(conn, ds_cstr(&ds));
+    ds_destroy(&ds);
+}
 
 int
 main(int argc, char *argv[])
