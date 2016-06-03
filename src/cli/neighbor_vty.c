@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2000 Kunihiro Ishiguro
- * Copyright (C) 2015 Hewlett Packard Enterprise Development LP
+ * Copyright (C) 2015-2016 Hewlett Packard Enterprise Development LP
  *
  * GNU Zebra is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -44,17 +44,30 @@
 #include "neighbor_vty.h"
 #include "openvswitch/vlog.h"
 #include "openswitch-idl.h"
+#include "vrf-utils.h"
 #include "smap.h"
 
 VLOG_DEFINE_THIS_MODULE (vtysh_neighbor_cli);
 extern struct ovsdb_idl *idl;
 
 static int
-show_arp_info (void)
+show_arp_info (char* vrf_name)
 {
   const struct ovsrec_neighbor *row = NULL;
+  const struct ovsrec_vrf *vrf_row = NULL;
 
   ovsdb_idl_run (idl);
+
+  if (NULL != vrf_name)
+  {
+    vrf_row = vrf_lookup(idl, vrf_name);
+    if (!vrf_row)
+      {
+        vty_out(vty, "VRF %s not found.%s", vrf_name, VTY_NEWLINE);
+        VLOG_DBG("%s VRF \"%s\" is not found.", __func__, vrf_name);
+        return CMD_SUCCESS;
+      }
+  }
 
   row = ovsrec_neighbor_first (idl);
   if (!row)
@@ -65,12 +78,17 @@ show_arp_info (void)
 
   vty_out (vty, "ARP IPv4 Entries:%s", VTY_NEWLINE);
   vty_out (vty, "------------------%s", VTY_NEWLINE);
-  vty_out (vty, "%-16s %-18s %-16s %-10s%s", "IPv4 Address", "MAC", "Port",
-           "State", VTY_NEWLINE);
+  vty_out (vty, "%-16s %-18s %-16s %-10s %-32s%s", "IPv4 Address", "MAC", "Port",
+           "State", "VRF", VTY_NEWLINE);
 
   /* OPS_TODO: Sort the output on Port (or other attribute) */
   OVSREC_NEIGHBOR_FOR_EACH (row, idl)
     {
+     /* If part of different VRF, ignore and move to next record */
+      if (vrf_name &&
+         (strncmp (row->vrf->name, vrf_name, OVSDB_VRF_NAME_MAXLEN) != 0))
+        continue;
+
       /* non-IPv4 entries, ignore and move to next record */
       if (strcmp (row->address_family, OVSREC_NEIGHBOR_ADDRESS_FAMILY_IPV4))
         continue;
@@ -79,6 +97,7 @@ show_arp_info (void)
       DISPLAY_NEIGHBOR_MAC_ADDR (vty, row);
       DISPLAY_NEIGHBOR_PORT_NAME (vty, row);
       DISPLAY_NEIGHBOR_STATE (vty, row);
+      DISPLAY_NEIGHBOR_VRF (vty, row);
 
       DISPLAY_VTY_NEWLINE (vty);
     }
@@ -88,12 +107,22 @@ show_arp_info (void)
 
 /* Handle 'show ipv6 neighbor' command */
 static int
-show_ipv6_neighbors (void)
+show_ipv6_neighbors (char* vrf_name)
 {
   const struct ovsrec_neighbor *row = NULL;
-
+  const struct ovsrec_vrf *vrf_row = NULL;
   ovsdb_idl_run (idl);
 
+  if (NULL != vrf_name)
+     {
+       vrf_row = vrf_lookup(idl, vrf_name);
+       if (!vrf_row)
+         {
+           vty_out(vty, "VRF %s not found.%s", vrf_name, VTY_NEWLINE);
+           VLOG_DBG("%s VRF \"%s\" is not found.", __func__, vrf_name);
+           return CMD_SUCCESS;
+         }
+     }
   row = ovsrec_neighbor_first (idl);
   if (!row)
     {
@@ -103,12 +132,17 @@ show_ipv6_neighbors (void)
 
   vty_out (vty, "IPv6 Entries:%s", VTY_NEWLINE);
   vty_out (vty, "------------------%s", VTY_NEWLINE);
-  vty_out (vty, "%-46s %-18s %-16s %-10s%s", "IPv6 Address", "MAC", "Port",
-           "State", VTY_NEWLINE);
+  vty_out (vty, "%-46s %-18s %-16s %-10s %-32s%s", "IPv6 Address", "MAC", "Port",
+           "State","VRF", VTY_NEWLINE);
 
   /* OPS_TODO: Sort the output on Port (or other attribute) */
   OVSREC_NEIGHBOR_FOR_EACH (row, idl)
     {
+     /* If part of different VRF, ignore and move to next record */
+      if (vrf_name &&
+         (strncmp (row->vrf->name, vrf_name, OVSDB_VRF_NAME_MAXLEN) != 0))
+        continue;
+
       /* non-IPv6 entries, ignore and move to next record */
       if (strcmp (row->address_family, OVSREC_NEIGHBOR_ADDRESS_FAMILY_IPV6))
         continue;
@@ -117,6 +151,7 @@ show_ipv6_neighbors (void)
       DISPLAY_NEIGHBOR_MAC_ADDR (vty, row);
       DISPLAY_NEIGHBOR_PORT_NAME (vty, row);
       DISPLAY_NEIGHBOR_STATE (vty, row);
+      DISPLAY_NEIGHBOR_VRF (vty, row);
 
       DISPLAY_VTY_NEWLINE (vty);
     }
@@ -124,15 +159,42 @@ show_ipv6_neighbors (void)
   return CMD_SUCCESS;
 }
 
+#ifdef VRF_ENABLE
+DEFUN (cli_arp_show,
+    cli_arp_show_cmd,
+    "show arp { vrf WORD }",
+    SHOW_STR
+    SHOW_ARP_STR
+    "VRF Information\n"
+    "VRF name\n")
+{
+  return show_arp_info((char*) argv[0]);
+}
+#else
 DEFUN (cli_arp_show,
     cli_arp_show_cmd,
     "show arp",
     SHOW_STR
     SHOW_ARP_STR)
 {
-  return show_arp_info();
+  return show_arp_info(NULL);
 }
+#endif
 
+#ifdef VRF_ENABLE
+DEFUN (cli_ipv6_show,
+    cli_ipv6_neighbors_show_cmd,
+    "show ipv6 neighbors {vrf WORD }",
+    SHOW_STR
+    IPV6_STR
+    SHOW_IPV6_NEIGHBOR_STR
+    "VRF Information\n"
+    "VRF name\n")
+
+{
+  return show_ipv6_neighbors((char*) argv[0]);
+}
+#else
 DEFUN (cli_ipv6_show,
     cli_ipv6_neighbors_show_cmd,
     "show ipv6 neighbors",
@@ -140,9 +202,9 @@ DEFUN (cli_ipv6_show,
     IPV6_STR
     SHOW_IPV6_NEIGHBOR_STR)
 {
-  return show_ipv6_neighbors();
+  return show_ipv6_neighbors(NULL);
 }
-
+#endif
 /*******************************************************************
  * @func        : arpmgr_ovsdb_init
  * @detail      : Add arpmgr related table & columns to ops-cli
@@ -159,6 +221,9 @@ arpmgr_ovsdb_init(void)
     ovsdb_idl_add_column(idl, &ovsrec_neighbor_col_state);
     ovsdb_idl_add_column(idl, &ovsrec_neighbor_col_ip_address);
     ovsdb_idl_add_column(idl, &ovsrec_neighbor_col_port);
+    ovsdb_idl_add_column(idl, &ovsrec_neighbor_col_vrf);
+    ovsdb_idl_add_table(idl, &ovsrec_table_vrf);
+    ovsdb_idl_add_column(idl, &ovsrec_vrf_col_name);
     return;
 }
 

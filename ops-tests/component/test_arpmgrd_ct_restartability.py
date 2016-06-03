@@ -1,4 +1,4 @@
-# (c) Copyright 2015 Hewlett Packard Enterprise Development LP
+# (c) Copyright 2015-2016 Hewlett Packard Enterprise Development LP
 # All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -41,7 +41,7 @@ sw1:if03 -- h3:if01
 mac1 = None
 mac2 = None
 # num of columns for 'show arp'/'show ipv6 neigh'
-column_count = 4
+column_count = 5
 
 
 def test_arp_manager_configure_and_setup(topology, step):

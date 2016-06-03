@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2015 Hewlett Packard Enterprise Development LP
+# Copyright (C) 2015-2016 Hewlett Packard Enterprise Development LP
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@ sw1:if02 -- hs2:eth0
 mac1 = None
 mac2 = None
 # num of columns for 'show arp'/'show ipv6 neigh'
-column_count = 4
+column_count = 5
 
 
 def arp_manager_configure_and_setup(sw1, hs1, hs2, step):
