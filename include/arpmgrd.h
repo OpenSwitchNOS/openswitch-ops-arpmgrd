@@ -20,6 +20,7 @@
 #define ARPMGRD_H_
 
 #include "openswitch-idl.h"
+#include "nl-utils.h"
 
 #define ARPMGR_POLL_INTERVAL 5
 #define LOOPBACK_INTERFACE_NAME "lo"

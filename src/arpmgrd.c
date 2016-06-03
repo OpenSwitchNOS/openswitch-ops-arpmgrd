@@ -15,13 +15,14 @@
  *
  * File: arpmgrd.c
  */
-
+#define _GNU_SOURCE
 #include <getopt.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <err.h>
 #include <errno.h>
@@ -32,6 +33,7 @@
 #include <linux/rtnetlink.h>
 #include <fcntl.h>
 #include <net/if.h>
+#include <sched.h>
 
 /* OVSDB Includes */
 #include "config.h"
@@ -46,7 +48,7 @@
 #include "coverage.h"
 #include "fatal-signal.h"
 #include "stream.h"
-
+#include "nl-utils.h"
 #include "arpmgrd.h"
 
 VLOG_DEFINE_THIS_MODULE(arpmgrd);
@@ -85,8 +87,20 @@ struct nl_req {
     struct ndmsg        ndm;
     char            buf[256];
 };
+
+struct vrf {
+    char *name;                 /* User-specified arbitrary name. */
+    const struct ovsrec_vrf *cfg;
+    /* VRF ports. */
+    struct shash ports;          /* "struct port"s indexed by name. */
+    int nl_sock;
+};
+
 static int nl_neighbor_sock;
 static void netlink_request_neighbor_dump(int sock);
+
+#define SWITCH_NAMESPACE "swns"
+#define MAX_BUFFER_LENGTH 64
 
 #define NDA_RTA(r) \
     ((struct rtattr*)(((char*)(r)) + NLMSG_ALIGN(sizeof(struct ndmsg))))
@@ -97,6 +111,7 @@ static void netlink_request_neighbor_dump(int sock);
 /* OVSDB Util */
 const struct ovsrec_port * find_port(const char *port_name);
 const struct ovsrec_vrf * find_port_vrf(const char *port_name);
+static struct vrf *find_port_vrf_in_cache(const char *port_name);
 
 /* Port cache structure */
 struct port_data {
@@ -106,9 +121,12 @@ struct port_data {
 /* Mapping of all ports */
 static struct shash all_ports = SHASH_INITIALIZER(&all_ports);
 
+/* Mapping of all vrfs */
+static struct shash all_vrfs = SHASH_INITIALIZER(&all_vrfs);
+
 /* Neighbor cache structure */
 struct neighbor_data {
-    const struct ovsrec_vrf *vrf;       /* pointer to vrf */
+    const struct vrf *vrf;       /* pointer to vrf */
     const struct ovsrec_port *port;     /* pointer to port */
     const struct ovsrec_neighbor *nbr;  /* pointer to nbr */
     char ip_address[INET6_ADDRSTRLEN];  /* Always nonnull. */
@@ -226,28 +244,65 @@ find_neighbor_in_cache(char *vrf_name, char *ip_address)
  * Open a netlink socket registering for group.
  * Send a neighbor dump request on socket
  * */
-static int
-netlink_socket_open(int protocol, int group)
+static void
+netlink_socket_open(const char *vrf_name, int *sock, int protocol, int group)
 {
     struct sockaddr_nl s_addr;
+    char prev_ns[MAX_BUFFER_LENGTH] = {0};
+    char set_ns[MAX_BUFFER_LENGTH] = {0};
+    int fd_from_ns = -1;
+    int fd_to_ns = -1;
 
-    int sock = socket(AF_NETLINK, SOCK_RAW, protocol);
-    if (sock < 0) {
+    if (vrf_name && (strcmp(vrf_name , DEFAULT_VRF_NAME)) != 0)
+    {
+       /* non default vrf. We need to open socket by entering corresponding namespace
+          Open FD to set the thread to a namespace */
+        strcat(set_ns, "/var/run/netns/");
+        strcat(prev_ns, "/var/run/netns/");
+        strncat(prev_ns, SWITCH_NAMESPACE, strlen(SWITCH_NAMESPACE));
+        strncat(set_ns, vrf_name, strlen(vrf_name));
+        fd_to_ns = open(set_ns, O_RDONLY);
+        fd_from_ns = open(prev_ns, O_RDONLY);
+        if (fd_from_ns == -1 || fd_to_ns == -1) {
+            VLOG_ERR("Unable to open fd for namepsace %s line number %d %s",
+                      vrf_name,__LINE__, strerror(errno));
+            goto label;
+        }
+        if (setns(fd_to_ns, 0) == -1) {
+            VLOG_ERR("Unable to set %s namespace to the thread %d %s",
+                      vrf_name, __LINE__, strerror(errno));
+            goto label;
+        }
+    }
+
+    *sock = socket(AF_NETLINK, SOCK_RAW, protocol);
+    if (*sock < 0) {
         VLOG_ERR("netlink socket open failed (%s)", strerror(errno));
-        return sock;
+	goto label;
     }
 
     memset((void *) &s_addr, 0, sizeof(s_addr));
     s_addr.nl_family = AF_NETLINK;
     s_addr.nl_pid = getpid();
     s_addr.nl_groups = group;
-    if (bind(sock, (struct sockaddr *) &s_addr, sizeof(s_addr)) < 0) {
+    if (bind(*sock, (struct sockaddr *) &s_addr, sizeof(s_addr)) < 0) {
         VLOG_ERR("netlink socket bind failed (%s)", strerror(errno));
-        return -1;
+	goto label;
     }
 
-    netlink_request_neighbor_dump(sock);
-    return sock;
+    netlink_request_neighbor_dump(*sock);
+
+label:
+     if (fd_from_ns != -1)
+    {
+        if (setns(fd_from_ns, 0) == -1) {
+            VLOG_ERR("Unable to set %s namespace to the thread %d", SWITCH_NAMESPACE, __LINE__);
+        }
+        close(fd_to_ns);
+        close(fd_from_ns);
+    }
+
+    return;
 } /* netlink_socket_open */
 
 /* close the netlink socket */
@@ -256,6 +311,7 @@ close_netlink_socket(int socket)
 {
     close(socket);
 } /* close_netlink_socket */
+
 
 /* Function to Send netlink message requesting Neighbor dump */
 static void
@@ -342,7 +398,7 @@ update_neighbor_to_ovsdb(struct neighbor_data *cache_nbr,
         } else {
             OVSREC_NEIGHBOR_FOR_EACH (ovs_nbr, idl) {
                 if (!strcmp((ovs_nbr)->ip_address, cache_nbr->ip_address) &&
-                        ovs_nbr->vrf == cache_nbr->vrf) {
+                        ovs_nbr->vrf == cache_nbr->vrf->cfg) {
                     /* Update cache with pointer to ovsrec */
                     cache_nbr->nbr = ovs_nbr;
                     found = true;
@@ -375,7 +431,7 @@ update_neighbor_to_ovsdb(struct neighbor_data *cache_nbr,
         ovs_nbr = ovsrec_neighbor_insert(txn);
         if (ovs_nbr) {
             ovsrec_neighbor_set_ip_address(ovs_nbr, cache_nbr->ip_address);
-            ovsrec_neighbor_set_vrf(ovs_nbr, cache_nbr->vrf);
+            ovsrec_neighbor_set_vrf(ovs_nbr, cache_nbr->vrf->cfg);
             ovsrec_neighbor_set_address_family(ovs_nbr, cache_nbr->network_family);
             ovsrec_neighbor_set_port(ovs_nbr, cache_nbr->port);
             ovsrec_neighbor_set_mac(ovs_nbr, cache_nbr->mac);
@@ -415,7 +471,7 @@ delete_cache_nbr_from_ovsdb(struct neighbor_data *cache_nbr)
     } else {
         OVSREC_NEIGHBOR_FOR_EACH (ovs_nbr, idl) {
             if (!strcmp((ovs_nbr)->ip_address, cache_nbr->ip_address) &&
-                    ovs_nbr->vrf == cache_nbr->vrf) {
+                    ovs_nbr->vrf == cache_nbr->vrf->cfg) {
                 /* Update cache with pointer to ovsrec */
                 cache_nbr->nbr = ovs_nbr;
                 found = true;
@@ -471,7 +527,7 @@ resync_db_with_kernel()
         VLOG_DBG("Updating port info for nbr cache dev %s",
                 cache_nbr->device);
         cache_nbr->port = find_port(cache_nbr->device);
-        cache_nbr->vrf = find_port_vrf(cache_nbr->device);
+        cache_nbr->vrf = find_port_vrf_in_cache(cache_nbr->device);
 
         VLOG_DBG("cache %s mac %s family %s port %s vrf %s", cache_nbr->ip_address,
                 cache_nbr->mac, cache_nbr->network_family, cache_nbr->port->name, cache_nbr->vrf->name);
@@ -521,7 +577,7 @@ resync_db_with_kernel()
  */
 static int
 update_neighbor_cache(int sock, struct ndmsg* ndm, struct rtattr* rta,
-                      const struct ovsrec_vrf *vrf, struct neighbor_data **cache_nbr)
+                      const struct vrf *vrf, struct neighbor_data **cache_nbr)
 {
     char destip[INET6_ADDRSTRLEN];
     char destmac[MAC_ADDRSTRLEN];
@@ -533,7 +589,7 @@ update_neighbor_cache(int sock, struct ndmsg* ndm, struct rtattr* rta,
         char key[VRF_IP_KEY_MAX_LEN];
         char dev[IF_NAMESIZE];
 
-        if_indextoname(ndm->ndm_ifindex, dev);
+        nl_if_indextoname(ndm->ndm_ifindex, dev, vrf->name);
         memset(destip, 0, sizeof(destip));
 
         if (ndm->ndm_family == AF_INET) {
@@ -658,11 +714,11 @@ update_neighbor_cache(int sock, struct ndmsg* ndm, struct rtattr* rta,
 /* Delete neighbor from cache and ovsdb */
 static int
 del_neighbor(struct ndmsg* ndm, struct rtattr* rta,
-             const struct ovsrec_vrf *vrf)
+             const struct vrf *vrf)
 {
     const struct ovsrec_neighbor *ovs_nbr;
     char dev[IF_NAMESIZE];
-    if_indextoname(ndm->ndm_ifindex, dev);
+    nl_if_indextoname(ndm->ndm_ifindex, dev, vrf->name);
 
     if (ndm->ndm_family != AF_INET && ndm->ndm_family != AF_INET6) {
         return -1;
@@ -681,7 +737,7 @@ del_neighbor(struct ndmsg* ndm, struct rtattr* rta,
             }
 
             OVSREC_NEIGHBOR_FOR_EACH (ovs_nbr, idl) {
-                if (!strcmp((ovs_nbr)->ip_address, destip) && ovs_nbr->vrf == vrf) {
+                if (!strcmp((ovs_nbr)->ip_address, destip) && ovs_nbr->vrf == vrf->cfg) {
                     found = true;
                     break;
                 }
@@ -702,7 +758,7 @@ del_neighbor(struct ndmsg* ndm, struct rtattr* rta,
 
 /* Parse Netlink message */
 static int
-parse_nlmsg(int sock, struct nlmsghdr *nlh, int msglen)
+parse_nlmsg(struct vrf *vrf, int sock, struct nlmsghdr *nlh, int msglen)
 {
     struct rtattr *rta;
     struct ndmsg *ndm;
@@ -716,13 +772,12 @@ parse_nlmsg(int sock, struct nlmsghdr *nlh, int msglen)
         if (!(ndm->ndm_state & NUD_NOARP)) {
             struct neighbor_data *cache_nbr = NULL;
             char ifname[IF_NAMESIZE];
-            const struct ovsrec_vrf *vrf = NULL;
+            struct vrf *local_vrf = NULL;
 
             if (ndm->ndm_family != AF_INET && ndm->ndm_family != AF_INET6) {
                 goto ndm_done;
             }
-
-            if_indextoname(ndm->ndm_ifindex, ifname);
+            nl_if_indextoname(ndm->ndm_ifindex, ifname, vrf->name);
 
             /* Ignore updates on "lo" interface */
             if(!strcmp(ifname, LOOPBACK_INTERFACE_NAME)) {
@@ -730,13 +785,13 @@ parse_nlmsg(int sock, struct nlmsghdr *nlh, int msglen)
             }
 
             /* Find vrf this interface/port is associated.*/
-            vrf = find_port_vrf(ifname);
+            local_vrf = find_port_vrf_in_cache(ifname);
             /*
              * If VRF is not found, this is strange.
              * Only L3 ports in VRFs should be getting arp
              * updates
              */
-            if (!vrf) {
+            if (!local_vrf) {
                 VLOG_ERR("Port not part of VRF %s", ifname);
                 goto ndm_done;
             }
@@ -751,10 +806,10 @@ parse_nlmsg(int sock, struct nlmsghdr *nlh, int msglen)
              */
             for (; RTA_OK(rta, rtalen); rta = RTA_NEXT(rta, rtalen)) {
                 if (nlh->nlmsg_type == RTM_NEWNEIGH) {
-                    update_neighbor_cache(sock, ndm, rta, vrf, &cache_nbr);
+                    update_neighbor_cache(sock, ndm, rta, local_vrf, &cache_nbr);
                 } else if (nlh->nlmsg_type == RTM_DELNEIGH) {
                     /* delete cache and ovsdb */
-                    del_neighbor(ndm, rta, vrf);
+                    del_neighbor(ndm, rta, local_vrf);
                 }
             }
 
@@ -774,7 +829,7 @@ ndm_done:
 
 /* Receive message on netlink socket */
 static int
-receive_neighbor_update(int sock)
+receive_neighbor_update(struct vrf *vrf, int sock)
 {
     int multipart_msg_end = 0;
     while (!multipart_msg_end) {
@@ -821,7 +876,7 @@ receive_neighbor_update(int sock)
 
         case RTM_NEWNEIGH:
         case RTM_DELNEIGH:
-            parse_nlmsg(sock, nlh, ret);
+            parse_nlmsg(vrf, sock, nlh, ret);
             break;
 
         case NLMSG_DONE:
@@ -862,25 +917,156 @@ const struct ovsrec_port
 /*
  * Return VRF which the Port is part of.
  */
+static struct vrf
+*find_port_vrf_in_cache(const char *port_name)
+{
+  struct shash_node *vrf_node = NULL;
+  struct shash_node *port_node = NULL;
+
+  SHASH_FOR_EACH(vrf_node, &all_vrfs) {
+       struct vrf *vrf = vrf_node->data;
+       SHASH_FOR_EACH(port_node,
+                             &vrf->ports) {
+        if (!strcmp(port_node->name, port_name)) {
+            return vrf;
+        }
+     }
+  }
+
+   return NULL;
+} /* find_port_vrf_in_cache */
+
+/*
+ * Return VRF which the Port is part of.
+ */
 const struct ovsrec_vrf
 *find_port_vrf(const char *port_name)
 {
-    const struct ovsrec_system *ovs_row = ovsrec_system_first(idl);
-    size_t i, j;
-    for (i = 0; i < ovs_row->n_vrfs; i++)
+    struct vrf *vrf = find_port_vrf_in_cache(port_name);
+    if (vrf)
     {
-        const struct ovsrec_vrf *vrf_cfg = ovs_row->vrfs[i];
-        for (j = 0; j < vrf_cfg->n_ports; j++)
-        {
-            struct ovsrec_port *port_cfg = vrf_cfg->ports[j];
-            if (strcmp(port_name, port_cfg->name) == 0)
-            {
-                return vrf_cfg;
-            }
-        }
+        return vrf->cfg;
     }
     return NULL;
 } /* find_port_vrf */
+
+/**
+ * Identify which 'vrf' a 'port' belongs to and return
+ * the corresponding vrf or NULL if not found
+ */
+static struct vrf*
+arpmgrd_vrf_lookup(const char *name)
+{
+    struct shash_node *node = NULL;
+
+    SHASH_FOR_EACH(node, &all_vrfs) {
+        struct vrf *vrf = node->data;
+        if (!strcmp(node->name, name)) {
+            return vrf;
+        }
+    }
+    return NULL;
+}
+
+
+/* delete vrf from cache */
+static void
+arpmgrd_vrf_del(struct shash_node *sh_node)
+{
+    if (sh_node) {
+        struct vrf *vrf = sh_node->data;
+        if (vrf) {
+            /* Delete all the associated ports before destroying vrf */
+
+            VLOG_DBG("Deleting vrf '%s'",vrf->name);
+
+            shash_delete(&all_vrfs, sh_node);
+            shash_destroy(&vrf->ports);
+            close(vrf->nl_sock);
+            free(vrf->name);
+            free(vrf);
+        }
+    }
+}
+
+/* add vrf into cache */
+static void
+arpmgrd_vrf_add(const struct ovsrec_vrf *vrf_row)
+{
+    struct vrf *vrf;
+
+    ovs_assert(!arpmgrd_vrf_lookup(vrf_row->name));
+    vrf = xzalloc(sizeof *vrf);
+
+    vrf->name = xstrdup(vrf_row->name);
+    vrf->cfg = vrf_row;
+    if (strcmp(vrf->name, DEFAULT_VRF_NAME) != 0)
+    {
+        char buff[UUID_LEN] = {0};
+        /* non default vrf. We need to open socket by entering corresponding
+          namespace Open FD to set the thread to a namespace */
+        sprintf(buff, UUID_FMT, UUID_ARGS(&(vrf->cfg->header_.uuid)));
+        netlink_socket_open(buff, &(vrf->nl_sock),  NETLINK_ROUTE, RTMGRP_NEIGH);
+    }
+    else
+    {
+        vrf->nl_sock = nl_neighbor_sock;
+    }
+
+    shash_init(&vrf->ports);
+    shash_add_once(&all_vrfs, vrf->name, vrf);
+
+    VLOG_DBG("Added vrf '%s'", vrf_row->name);
+}
+
+static void
+arpmgrd_vrf_add_ports(struct vrf *vrf, const struct ovsrec_vrf *vrf_row)
+{
+    int i;
+
+    shash_destroy(&vrf->ports);
+    shash_init(&vrf->ports);
+    for (i = 0; i < vrf_row->n_ports; i++) {
+        const char *name = vrf_row->ports[i]->name;
+        shash_add_once(&vrf->ports, name, vrf_row->ports[i]);
+    }
+}
+
+static void
+arpmgrd_add_del_vrf(struct ovsdb_idl *idl)
+{
+    struct vrf *vrf;
+    struct shash new_vrfs;
+    struct shash_node *node, *next;
+    const struct ovsrec_vrf *vrf_row = NULL;
+
+    /* Collect new vrfs' names and types. */
+    shash_init(&new_vrfs);
+    OVSREC_VRF_FOR_EACH (vrf_row, idl) {
+        shash_add_once(&new_vrfs, vrf_row->name, vrf_row);
+    }
+
+    /* Delete the vrfs' that are deleted from the db */
+    SHASH_FOR_EACH_SAFE (node, next, &all_vrfs) {
+        vrf = shash_find_data(&all_vrfs, node->name);
+        vrf->cfg = shash_find_data(&new_vrfs, vrf->name);
+        if (!vrf->cfg) {
+            arpmgrd_vrf_del(node);
+        }
+    }
+
+    /* Add new vrfs. */
+    OVSREC_VRF_FOR_EACH (vrf_row, idl) {
+        struct vrf *vrf = arpmgrd_vrf_lookup(vrf_row->name);
+        if (!vrf) {
+            arpmgrd_vrf_add(vrf_row);
+        } else {
+            arpmgrd_vrf_add_ports(vrf, vrf_row);
+        }
+    }
+
+    shash_destroy(&new_vrfs);
+}
 
 /* arpmgrd - OVSDB */
 /* Function check if system is configured */
@@ -935,6 +1121,7 @@ arpmgrd_init(const char *remote)
     ovsdb_idl_add_table(idl, &ovsrec_table_vrf);
     ovsdb_idl_add_column(idl, &ovsrec_vrf_col_name);
     ovsdb_idl_add_column(idl, &ovsrec_vrf_col_ports);
+    ovsdb_idl_add_column(idl, &ovsrec_vrf_col_status);
 
     ovsdb_idl_add_table(idl, &ovsrec_table_port);
     ovsdb_idl_add_column(idl, &ovsrec_port_col_name);
@@ -955,9 +1142,13 @@ arpmgrd_exit(void)
 static void
 arpmgrd_run__(void)
 {
+    struct shash_node *vrf_node = NULL;
     /* Receive Neighbor updates over netlink */
-    if(nl_neighbor_sock > 0) {
-        receive_neighbor_update(nl_neighbor_sock);
+    SHASH_FOR_EACH(vrf_node, &all_vrfs) {
+        struct vrf *vrf = vrf_node->data;
+        if (vrf->nl_sock > 0) {
+             receive_neighbor_update(vrf, vrf->nl_sock);
+        }
     }
 } /* arpmgrd_run__ */
 
@@ -1050,6 +1241,14 @@ arpmgrd_reconfigure_port(struct ovsdb_idl *idl)
                     continue;
                 }
                 new_port->port = port_row;
+                struct vrf* vrf = find_port_vrf_in_cache(port_row->name);
+                int local_sock = (vrf == NULL) ? nl_neighbor_sock : vrf->nl_sock;
+
+                /* Send netlink DUMP request to kernel to check for any existing
+                 * neighbors on this PORT */
+                if (local_sock > 0) {
+                    netlink_request_neighbor_dump(local_sock);
+                }
             }
         }
         /* Send netlink DUMP request to kernel to check for any existing
@@ -1153,6 +1352,7 @@ arpmgrd_reconfigure(struct ovsdb_idl *idl)
         return;
     }
 
+    arpmgrd_add_del_vrf(idl);
     arpmgrd_reconfigure_port(idl);
     arpmgrd_reconfigure_neighbor(idl);
 
@@ -1210,7 +1410,7 @@ arpmgrd_run(void)
                    nl_neighbor_sock = 0;
 
                    /* Open new socket for resync */
-                   nl_neighbor_sock = netlink_socket_open(NETLINK_ROUTE, 0);
+                   netlink_socket_open(DEFAULT_VRF_NAME, &nl_neighbor_sock, NETLINK_ROUTE, 0);
                 }
             }
             /* Update state to sync_in_progress */
@@ -1219,7 +1419,7 @@ arpmgrd_run(void)
 
         if (!nl_neighbor_sock) {
             VLOG_DBG("opening netlink socket");
-            nl_neighbor_sock = netlink_socket_open(NETLINK_ROUTE, RTMGRP_NEIGH);
+            netlink_socket_open(DEFAULT_VRF_NAME, &nl_neighbor_sock, NETLINK_ROUTE, RTMGRP_NEIGH);
         }
         /*
          * If previous transaction status was incomplete
