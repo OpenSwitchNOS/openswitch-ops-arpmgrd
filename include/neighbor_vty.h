@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 1997, 98 Kunihiro Ishiguro
- * Copyright (C) 2015 Hewlett Packard Enterprise Development LP
+ * Copyright (C) 2015-2016 Hewlett Packard Enterprise Development LP
  *
  * GNU Zebra is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -64,6 +64,14 @@
             vty_out(vty, "%-10s ", row->state); \
         else                                \
             vty_out(vty, "%-10s ", EMPTY_STRING);\
+    } while(0)                              \
+
+#define DISPLAY_NEIGHBOR_VRF(vty, row)    \
+    do {                                    \
+        if (row->vrf)                       \
+            vty_out(vty, "%-32s ", row->vrf->name); \
+        else                                \
+            vty_out(vty, "%-32s ", EMPTY_STRING);\
     } while(0)                              \
 
 #define DISPLAY_VTY_NEWLINE(vty)        \
