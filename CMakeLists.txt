@@ -27,9 +27,10 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu99 -Wall -Werror")
 include(FindPkgConfig)
 pkg_check_modules(OVSCOMMON REQUIRED libovscommon)
 pkg_check_modules(OVSDB REQUIRED libovsdb)
+pkg_check_modules(OPSUTILS REQUIRED opsutils)
 
 include_directories (${PROJECT_BINARY_DIR} ${PROJECT_SOURCE_DIR}/${INCL_DIR}
-                     ${OVSCOMMON_INCLUDE_DIRS}
+                     ${OVSCOMMON_INCLUDE_DIRS} ${OPSUTILS_LIBRARIES}
 )
 
 # Source files to build arpmgrd

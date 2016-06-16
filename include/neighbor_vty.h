@@ -66,6 +66,14 @@
             vty_out(vty, "%-10s ", EMPTY_STRING);\
     } while(0)                              \
 
+#define DISPLAY_NEIGHBOR_VRF(vty, row)    \
+    do {                                    \
+        if (row->vrf)                       \
+            vty_out(vty, "%-16s ", row->vrf->name); \
+        else                                \
+            vty_out(vty, "%-16s ", DEFAULT_VRF_NAME);\
+    } while(0)                              \
+
 #define DISPLAY_VTY_NEWLINE(vty)        \
     do {                                \
         vty_out(vty, "%s", VTY_NEWLINE);\
