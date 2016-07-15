@@ -33,7 +33,9 @@ include_directories (${PROJECT_BINARY_DIR} ${PROJECT_SOURCE_DIR}/${INCL_DIR}
 )
 
 # Source files to build arpmgrd
-set (SOURCES ${SRC_DIR}/arpmgrd.c)
+set (SOURCES ${SRC_DIR}/arpmgrd.c
+             ${SRC_DIR}/ping_send.c
+    )
 
 # Rules to build arpmgrd
 add_executable (${ARPMGRD} ${SOURCES})
