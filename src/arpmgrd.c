@@ -385,7 +385,22 @@ update_neighbor_to_ovsdb(struct neighbor_data *cache_nbr,
 {
     const struct ovsrec_neighbor *ovs_nbr;
     bool found = false;
-
+    /* Some of the fields are not yet populated for the externally generated neighbor. Lets do them here*/
+    if(cache_nbr->in_use_by_routes_unresolved){
+        cache_nbr->in_use_by_routes_unresolved = false;
+        ovs_nbr = cache_nbr->nbr;
+        ovsrec_neighbor_set_address_family(ovs_nbr, cache_nbr->network_family);
+        ovsrec_neighbor_set_port(ovs_nbr, cache_nbr->port);
+        /* I assumeexternal module may not know proper mac, so lets' add it */
+        if(cache_nbr->mac)
+            ovsrec_neighbor_set_mac(ovs_nbr, cache_nbr->mac);
+        /* The state information may have created but might be updated by kernel */
+        if(cache_nbr->state) {
+            ovsrec_neighbor_set_state(ovs_nbr, cache_nbr->state);
+        }
+        ovsdb_commit_required = true;
+        return 1;
+    }
     if (!insert_row_without_checking) {
         /*
          * Check of cache entry has pointer to ovsrec, else search in idl
@@ -1357,8 +1372,9 @@ arpmgrd_reconfigure_neighbor(struct ovsdb_idl *idl)
         bool dp_hit;
         if(ovs_nbr &&
                 OVSREC_IDL_IS_ROW_INSERTED(ovs_nbr, idl_seqno)&&
-                (ovs_nbr->in_use_by_routes && (*(ovs_nbr->in_use_by_routes) == true) &&
-                 ovs_nbr->state && (0 == strcmp(ovs_nbr->state, OVSREC_NEIGHBOR_STATE_INCOMPLETE)))
+                (ovs_nbr->in_use_by_routes && (*(ovs_nbr->in_use_by_routes) == true)) &&
+                (!ovs_nbr->state ||
+                 (ovs_nbr->state && (0 == strcmp(ovs_nbr->state, OVSREC_NEIGHBOR_STATE_INCOMPLETE))))
                 ){
             VLOG_INFO("Neighbor entry is added by external module. ip %s, vrf %s",
                     ovs_nbr->ip_address, ovs_nbr->vrf->name);
