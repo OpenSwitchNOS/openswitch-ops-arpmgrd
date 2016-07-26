@@ -18,6 +18,7 @@
 from opsvsi.docker import *
 from opsvsi.opsvsitest import *
 from opsvsiutils.systemutil import *
+from pytest import set_trace
 
 
 class arpManagerRestartabiltyTests(OpsVsiTest):
@@ -123,6 +124,7 @@ class arpManagerRestartabiltyTests(OpsVsiTest):
         s1 = self.net.switches[0]
         h1 = self.net.hosts[0]
         h2 = self.net.hosts[1]
+        set_trace()
         # Show Neighbors
         info("Show neighbors\n")
         output = s1.cmdCLI("do show arp")
@@ -390,8 +392,10 @@ class arpManagerRestartabiltyTests(OpsVsiTest):
         info("Restarting arpmgrd\n")
         s1.cmd("ip netns exec swns ops-arpmgrd --pidfile --detach")
 
-        time.sleep(10)
+        time.sleep(20)
         output = s1.cmdCLI("do show arp")
+        info("nwe print\n")
+        info(output + "\n")
         rows = output.split("\n")
         rowcount = len(rows) - 5
         assert rowcount == 2, \
@@ -408,7 +412,7 @@ class arpManagerRestartabiltyTests(OpsVsiTest):
         info("Failed entries state updated db after arpmgrd restart\n")
 
 
-@pytest.mark.skipif(True, reason="Disabling old tests")
+#@pytest.mark.skipif(True, reason="Disabling old tests")
 class Test_arp_manager_restartability:
 
     def setup_class(cls):
@@ -427,10 +431,10 @@ class Test_arp_manager_restartability:
     def test_arp_manager_restart_check_new_updates(self):
         self.test.arp_manager_restart_check_new_updates()
 
-    def teardown_class(cls):
+    #def teardown_class(cls):
         # Stop the Docker containers, and
         # mininet topology
-        Test_arp_manager_restartability.test.net.stop()
+        #Test_arp_manager_restartability.test.net.stop()
 
     def __del__(self):
         del self.test
