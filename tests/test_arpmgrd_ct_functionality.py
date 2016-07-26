@@ -150,9 +150,11 @@ class arpManagerFunctionalityTests(OpsVsiTest):
         info(output1 + "\n\n")
         time.sleep(3)
         # Show Neighbors
+        #time.sleep(3)
         info("Show neighbors\n")
         # workaround to get latest update call show twice, needs to be fixed in
         # CLI
+        #time.sleep(5)
         output = s1.cmdCLI("do show arp")
         output = s1.cmdCLI("do show arp")
         output = output + "\n" + s1.cmdCLI("do show ipv6 neighbors")
@@ -493,7 +495,6 @@ class arpManagerFunctionalityTests(OpsVsiTest):
         info("########## End of delete entry test ##########\n")
 
 
-@pytest.mark.skipif(True, reason="Disabling old tests")
 class Test_arp_manager_functionality:
     # Create the Mininet topology based on mininet.
 
