@@ -87,7 +87,11 @@ typedef enum sync_mode {
 static sync_mode_e sync_mode = SYNC_WITHOUT_CACHE_RESET;
 static sync_state_e sync_state = SYNC_REQUESTED;
 static int gbl_nl_pkt_process_cnt_per_iter = 100;
-
+static bool dbg_stop_nh_probe = 1;
+/*This change is to for testing only. stop reprobing nh_entry when it goes to stale.
+GC_THRES2 and GC_THRESh3 = 256. 255 static entrt and only 1 nh entry. ARP GC try to free up memory, rest entries are
+permanent,this alone is removable. expectation is nh_entries should try ping for MAX_NH_PING_CNT before disappearing
+from kernel and nbr tbl in db. */
 /* Netlink */
 struct nl_req {
     struct nlmsghdr     nlh;
@@ -130,6 +134,8 @@ struct neighbor_data {
     bool in_use_by_routes_unresolved;   /* the neighbor entry is a next hop */
     bool routes_nh;
     unsigned int ping_retry_cnt;         /* retry ping cnt for routes_nh */
+    unsigned int avoid_nh_del_ping_cnt;  /* retry ping cnt for routes_nh before deleting from kernel */
+    unsigned int revalidate_del_bfr_dbupdate; /* this flag is to avoid db update for nbr entry*/
     char vrf_name[OVSDB_VRF_NAME_MAXLEN];/* VRF name */
 };
 /* Mapping of all the neighbors. */
@@ -622,6 +628,12 @@ update_neighbor_cache(int sock, struct ndmsg* ndm, struct rtattr* rta,
                 found = true;
                 goto end_chache_nbr_init;
             }
+            /*This entry was triggered for delete, so all the fields are populated for it. Already ping in flight,
+            no need to for dp_hit probe.*/
+            else if((*cache_nbr)->revalidate_del_bfr_dbupdate){
+                skip_dp_hit = true;
+                goto end_chache_nbr_init;
+            }
             else {
                 found = true;
             }
@@ -659,12 +671,16 @@ end_chache_nbr_init:
         case NUD_REACHABLE:
             strcpy((*cache_nbr)->state, OVSREC_NEIGHBOR_STATE_REACHABLE);
             (*cache_nbr)->ping_retry_cnt = 0;
+            /*revalidatation is complete, db can be update after that*/
+            (*cache_nbr)->revalidate_del_bfr_dbupdate = 0;
             break;
 
         case NUD_STALE:
             /* Send probe request to STALE neighbor and dp_hit set */
             /* Set dp_hit default to be false */
             dp_hit = false;
+            (*cache_nbr)->ping_retry_cnt = 0; // may be after ping from switch host entry cannot be stale.
+            (*cache_nbr)->revalidate_del_bfr_dbupdate = 0;
             if ((!skip_dp_hit) && ((*cache_nbr)->nbr)) {
                 dp_hit = smap_get_bool(&(*cache_nbr)->nbr->status ,
                          OVSDB_NEIGHBOR_STATUS_DP_HIT,
@@ -674,13 +690,13 @@ end_chache_nbr_init:
             VLOG_DBG("dp hit state = %d ip %s", dp_hit, destip);
             (*cache_nbr)->dp_hit = dp_hit;
             if (sock &&
-               (dp_hit ||((*cache_nbr)->routes_nh))) {
+               (dp_hit ||(!dbg_stop_nh_probe && (*cache_nbr)->routes_nh))) {
                 send_neighbor_probe(sock, ndm->ndm_ifindex, ndm->ndm_family,
                     RTA_DATA(rta), RTA_PAYLOAD(rta));
                 /*
                  * FIXME: Set state to reachable. Currently we are not receiving
                  * Reachable state from Stale state. (Bug)
-                 * If kernel is unable to resolve, we will get an explicit
+)                 * If kernel is unable to resolve, we will get an explicit
                  * notification for FAILED state
                  */
                 strcpy((*cache_nbr)->state, OVSREC_NEIGHBOR_STATE_REACHABLE);
@@ -692,6 +708,8 @@ end_chache_nbr_init:
 
         case NUD_FAILED:
             VLOG_DBG("Neighbor resolution failed %s", destip);
+            (*cache_nbr)->revalidate_del_bfr_dbupdate = 0;
+            /*ping if the nbe is nh. no matter how it land up in this state.*/
             if((*cache_nbr)->routes_nh && ((*cache_nbr)->ping_retry_cnt < MAX_NH_PING_CNT)) {
                 VLOG_ERR("pinging again for the in_use_by_route %s, destip = %s", (*cache_nbr)->ip_address, destip);
                  if((*cache_nbr)->network_family){
@@ -718,8 +736,11 @@ end_chache_nbr_init:
 
         case NUD_INCOMPLETE:
             VLOG_DBG("Neighbor resolution incomplete %s", destip);
-            strcpy((*cache_nbr)->state, OVSREC_NEIGHBOR_STATE_INCOMPLETE);
-            strcpy((*cache_nbr)->mac, "");
+            /*If staborn nh entry refuse to go away from db, then don't change mac in db and state. */
+            if(!(*cache_nbr)->revalidate_del_bfr_dbupdate){
+                strcpy((*cache_nbr)->state, OVSREC_NEIGHBOR_STATE_INCOMPLETE);
+                strcpy((*cache_nbr)->mac, "");
+            }
             break;
 
         case NUD_PERMANENT:
@@ -729,6 +750,7 @@ end_chache_nbr_init:
         case NUD_DELAY:
         case NUD_PROBE:
         default:
+            (*cache_nbr)->revalidate_del_bfr_dbupdate = 0;
             strcpy((*cache_nbr)->state, OVSREC_NEIGHBOR_STATE_REACHABLE);
             break;
 
@@ -769,6 +791,24 @@ del_neighbor(struct ndmsg* ndm, struct rtattr* rta,
                 inet_ntop(AF_INET, RTA_DATA(rta), destip, INET_ADDRSTRLEN);
             } else if (ndm->ndm_family == AF_INET6) {
                 inet_ntop(AF_INET6, RTA_DATA(rta), destip, INET6_ADDRSTRLEN);
+            }
+            struct neighbor_data *cache_nbr = find_neighbor_in_cache(vrf->name, destip);
+            if(!cache_nbr){
+                VLOG_ERR("Unable to delete a neighbor %s, vrf %s that has entry in hash",destip, vrf->name);
+                return -1;
+            }
+            if(cache_nbr->routes_nh && (cache_nbr->avoid_nh_del_ping_cnt < MAX_NH_PING_CNT)) {
+                VLOG_INFO("Del notified for %s, but pinging again to keep it refreshed... ",destip);
+                if (ndm->ndm_family == AF_INET) {
+                    ping4(destip);
+                }
+                else if(ndm->ndm_family == AF_INET6) {
+                    ping6(destip);
+                }
+                cache_nbr->revalidate_del_bfr_dbupdate = true;
+                strcpy(cache_nbr->state, OVSREC_NEIGHBOR_STATE_INCOMPLETE);
+                cache_nbr->avoid_nh_del_ping_cnt++;
+                return 1;
             }
 
             OVSREC_NEIGHBOR_FOR_EACH (ovs_nbr, idl) {
@@ -852,7 +892,8 @@ parse_nlmsg(int sock, struct nlmsghdr *nlh, int msglen)
             /*
              * If a new neighbor was added/modified, lets update OVSDB
              * */
-            if (cache_nbr) {
+            if (cache_nbr &&
+                !(cache_nbr->revalidate_del_bfr_dbupdate)) {
                 update_neighbor_to_ovsdb(cache_nbr, false);
             }
         }
