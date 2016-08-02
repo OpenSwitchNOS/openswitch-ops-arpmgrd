@@ -1388,11 +1388,7 @@ arpmgrd_reconfigure_neighbor(struct ovsdb_idl *idl)
         struct neighbor_data *cache_nbr;
         bool dp_hit;
         if(ovs_nbr &&
-                OVSREC_IDL_IS_ROW_INSERTED(ovs_nbr, idl_seqno)&&
-                (ovs_nbr->in_use_by_routes && (*(ovs_nbr->in_use_by_routes) == true)) &&
-                (!ovs_nbr->state ||
-                 (ovs_nbr->state && (0 == strcmp(ovs_nbr->state, OVSREC_NEIGHBOR_STATE_INCOMPLETE))))
-                ){
+                OVSREC_IDL_IS_ROW_INSERTED(ovs_nbr, idl_seqno)) {
             VLOG_INFO("Neighbor entry is added by external module. ip %s, vrf %s",
                     ovs_nbr->ip_address, ovs_nbr->vrf->name);
             /*Process for neighbor entry add into cache */
@@ -1403,31 +1399,36 @@ arpmgrd_reconfigure_neighbor(struct ovsdb_idl *idl)
                 cache_nbr = add_neighbor_to_cache(ovs_nbr->vrf->name, ovs_nbr->ip_address);
                 if (!(cache_nbr)) {
                     VLOG_ERR("Unable to add new neighbor.<ip> %s <vrf>%s",
-                                    ovs_nbr->ip_address,ovs_nbr->vrf->name);
+                            ovs_nbr->ip_address,ovs_nbr->vrf->name);
                     return ;
                 }
                 char *mac_addr = NULL;
                 char *state = OVSREC_NEIGHBOR_STATE_INCOMPLETE;
                 update_configured_entry_to_neighbor_cache(ovs_nbr, cache_nbr, &family, mac_addr,state);
                 cache_nbr->in_use_by_routes_unresolved = true;
-                cache_nbr->routes_nh = true;
+                if((ovs_nbr->in_use_by_routes && (*(ovs_nbr->in_use_by_routes) == true)) &&
+                        (!ovs_nbr->state ||
+                         (ovs_nbr->state && (0 == strcmp(ovs_nbr->state, OVSREC_NEIGHBOR_STATE_INCOMPLETE))))
+                  ) {
+                    cache_nbr->routes_nh = true;
 
-                /*Entry added in nbr cache, now initiate a ping to get added into the kernel ND table
-                * Kernel shall find the proper egress interface for the ping pkt
-                *   create a neighbour entry, mark its state as 'incomplete'
-                *   Resolve its mac either by arp/ND protocol.
-                *   Notify back to arpmgrd via netlink notification.
-                */
-                VLOG_INFO("externerally added entry is placed in cache, invoking ping...");
-                int ping_err = -1;
-                if(family == AF_INET6){
-                    ping_err = ping6(ovs_nbr->ip_address);
-                }
-                else {
-                    ping_err = ping4(ovs_nbr->ip_address);
-                }
-                if(ping_err < 0) {
-                    reinstal_nh = true;
+                    /*Entry added in nbr cache, now initiate a ping to get added into the kernel ND table
+                     * Kernel shall find the proper egress interface for the ping pkt
+                     *   create a neighbour entry, mark its state as 'incomplete'
+                     *   Resolve its mac either by arp/ND protocol.
+                     *   Notify back to arpmgrd via netlink notification.
+                     */
+                    VLOG_INFO("externerally added entry is placed in cache, invoking ping...");
+                    int ping_err = -1;
+                    if(family == AF_INET6){
+                        ping_err = ping6(ovs_nbr->ip_address);
+                    }
+                    else {
+                        ping_err = ping4(ovs_nbr->ip_address);
+                    }
+                    if(ping_err < 0) {
+                        reinstal_nh = true;
+                    }
                 }
             }
             continue;
