@@ -720,7 +720,7 @@ update_neighbor_cache(int sock, struct ndmsg* ndm, struct rtattr* rta,
 
             (*cache_nbr)->nbr = NULL;
         }
-
+end_chache_nbr_init:
         switch (ndm->ndm_state) {
 
         case NUD_REACHABLE:
@@ -1299,6 +1299,7 @@ arpmgrd_init(const char *remote)
     ovsdb_idl_add_column(idl, &ovsrec_neighbor_col_state);
     ovsdb_idl_omit_alert(idl, &ovsrec_neighbor_col_state);
     ovsdb_idl_add_column(idl, &ovsrec_neighbor_col_status);
+    ovsdb_idl_add_column(idl, &ovsrec_neighbor_col_in_use_by_routes);
 
     ovsdb_idl_add_table(idl, &ovsrec_table_vrf);
     ovsdb_idl_add_column(idl, &ovsrec_vrf_col_name);
